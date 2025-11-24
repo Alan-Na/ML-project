@@ -1,6 +1,3 @@
-# ensemble_softmax_mlp_v3.py
-# -*- coding: utf-8 -*-
-
 import re, math, random
 import numpy as np
 import pandas as pd
@@ -10,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
 from sklearn.model_selection import GroupShuffleSplit
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.compose import ColumnTransformer
@@ -19,25 +17,22 @@ from sklearn.impute import SimpleImputer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
 
 # ---------------- Config ----------------
-CSV_PATH     = "training_data_conflict_removed.csv"
+CSV_PATH     = "training_data_clean.csv"
 TARGET_COL   = "label"
 TEST_SIZE    = 0.20
 VAL_SIZE     = 0.15
 
-# Softmax 方案 3：Softmax 和 MLP 完全共享“结构化特征工程”
 SOFTMAX_C_GRID       = [1.0, 0.5, 0.2, 0.1, 0.05]
-SOFTMAX_REFIT_TRAIN  = True  # 选好 C 后是否在 train 上重训一遍
+SOFTMAX_REFIT_TRAIN  = True 
 
-# 用于共享预处理器内文本 TF-IDF 的参数
 TFIDF_MIN_DF   = 2
 TFIDF_NGRAM    = (1, 2)
-TFIDF_MAX_FEAT = None      # 这里共享 SVD 后维度本身受控，可不强制上限
-TFIDF_MAX_DF   = 1.0       # 在 shared preprocessor 中通常不用太严格的上限
+TFIDF_MAX_FEAT = None     
+TFIDF_MAX_DF   = 1.0      
 
-# SVD + MLP 侧
+# SVD + MLP
 SVD_N_COMP   = 100
 BATCH_SIZE   = 64
 MAX_EPOCHS   = 50
@@ -51,10 +46,10 @@ N_RUNS       = 200
 SEED_BASE    = 42
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Ensemble 
 w_lr  = 0.4
 w_mlp = 0.6
 
-# === 关键列名 ===
 LIKERT_ACADEMIC = "How likely are you to use this model for academic tasks?"
 LIKERT_SUBOPT_FREQ = "Based on your experience, how often has this model given you a response that felt suboptimal?"
 LIKERT_EXPECT_REF = "How often do you expect this model to provide responses with references or supporting evidence?"
@@ -84,7 +79,6 @@ ORDINAL_COL_MAPS = {
     LIKERT_VERIFY_FREQ: ORDINAL_MAP_FREQ,
 }
 
-# 多选题关键字（用于 multi-hot）
 TASK_KEYWORDS = {
     "math": "Math computations",
     "coding": "Writing or debugging code",
@@ -108,10 +102,10 @@ def seed_all(seed=42):
 def load_df(path):
     df = pd.read_csv(path)
     if TARGET_COL not in df.columns:
-        raise ValueError(f"缺少目标列 {TARGET_COL}")
+        raise ValueError(f"lack of {TARGET_COL}")
     if "student_id" not in df.columns:
         df["student_id"] = np.arange(len(df))
-        print("[WARN] 未找到 student_id，退化为按行分组。")
+        print("[WARN] no student_id")
     return df
 
 def detect_id_like_columns(df, max_unique_ratio=0.9):
@@ -137,13 +131,6 @@ def join_text_columns(X):
     return X.astype(str).fillna("").agg(" ".join, axis=1)
 
 def build_preprocessor(num_cols, cat_cols, text_cols, svd_seed):
-    """
-    共享预处理器：
-    - 数值：median 填充
-    - 类别：常量填充 + OHE
-    - 文本：join -> TfidfVectorizer -> TruncatedSVD
-    - 整体：MaxAbsScaler
-    """
     num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
     try:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
@@ -168,11 +155,10 @@ def build_preprocessor(num_cols, cat_cols, text_cols, svd_seed):
          ("cat", cat_pipe, cat_cols),
          ("text", text_pipe, text_cols)],
         remainder="drop",
-        sparse_threshold=0.0    # 强制输出 dense
+        sparse_threshold=0.0  
     )
     return Pipeline([("preprocess", preprocess), ("scale", MaxAbsScaler())])
 
-# Likert & 多选（这里保留 encode_ordinal_likert 但 v3 不强制使用）
 def encode_ordinal_likert(df):
     for col, mapping in ORDINAL_COL_MAPS.items():
         if col not in df.columns:
@@ -181,11 +167,6 @@ def encode_ordinal_likert(df):
     return df
 
 def expand_multi_select(df, col, prefix):
-    """
-    多选题拆分成 multi-hot：
-    - prefix_math, prefix_coding, ...
-    - 并删除原长文本列
-    """
     if col not in df.columns:
         return df
     s = df[col].fillna("")
@@ -232,7 +213,6 @@ def eval_model_with_probs(model, loader):
     probs_all = np.vstack(probs_all) if probs_all else np.zeros((0, 0), dtype=np.float32)
     return np.array(y_true), np.array(y_pred), probs_all
 
-# ---------------- 分组划分 ----------------
 def grouped_split_with_all_classes(y, groups, test_size, seed, max_tries=50):
     all_classes = np.unique(y)
     tries = 0
@@ -248,12 +228,10 @@ def grouped_split_with_all_classes(y, groups, test_size, seed, max_tries=50):
             return tr_idx, te_idx
         tries += 1
         if tries >= max_tries:
-            print("[WARN] 尝试多次仍未覆盖全部类别，使用最后一次切分。")
+            print("[WARN] use last one")
             return last
 
-# ---------------- Softmax（LR）相关工具 ----------------
 def _align_proba(P_raw, clf_classes, classes):
-    """把 LR 输出概率矩阵对齐到全局 classes 顺序"""
     cls_lr = list(map(str, clf_classes))
     col_map = {c: i for i, c in enumerate(cls_lr)}
     P = np.zeros((P_raw.shape[0], len(classes)), dtype=np.float32)
@@ -267,12 +245,6 @@ def _align_proba(P_raw, clf_classes, classes):
     return P / row_sum
 
 def _train_lr_with_val(X_tr, y_tr, X_val, y_val, seed, c_grid):
-    """
-    在共享特征上训练 LogisticRegression：
-    - 仅在 train 上 fit；
-    - 用 val_set 选择最佳 C；
-    - 可选在 train 上用最佳 C 重训一次。
-    """
     best, best_c, best_acc = None, None, -1.0
     for C in c_grid:
         clf = LogisticRegression(
@@ -289,47 +261,36 @@ def _train_lr_with_val(X_tr, y_tr, X_val, y_val, seed, c_grid):
             best_acc = acc_val
             best_c = C
             best = clf
-   
+
     if SOFTMAX_REFIT_TRAIN and best_c is not None:
-        # 合并训练集和验证集
         X_train_full = np.vstack([X_tr, X_val])
         y_train_full = np.concatenate([y_tr, y_val])
-        
+
         best = LogisticRegression(
             multi_class="multinomial",
             solver="lbfgs",
-            C=best_c, # 使用选出来的最佳 C
+            C=best_c,
             max_iter=3000,
             random_state=seed
         ).fit(X_train_full, y_train_full)
     return best, best_c, best_acc
 
-# ---------------- 共享特征工程：Softmax & MLP 共用 ----------------
 def _compute_shared_features(df, train_idx, val_idx, test_idx, seed):
-    """
-    在 train 子集上拟合 shared preprocessor，并对 train/val/test 统一 transform。
-    - 丢掉 ID-like 列（含 student_id）
-    - 多选题展开为 multi-hot（并删除原问句列）
-    - Likert 保持字符串形式（交给 OHE）
-    - 文本列自动检测并走 TF-IDF→SVD
-    """
     dfm = df.copy()
 
-    # 丢掉 ID-like 列（含 student_id）
+    # drop id column
     id_cols = detect_id_like_columns(dfm.drop(columns=[TARGET_COL], errors="ignore"))
     if "student_id" in dfm.columns:
         id_cols = list(set(id_cols) | {"student_id"})
     if id_cols:
         dfm = dfm.drop(columns=id_cols, errors="ignore")
 
-    # 多选题展开为 multi-hot，并删除原列
     dfm = expand_multi_select(dfm, MULTI_BEST,  prefix="best")
     dfm = expand_multi_select(dfm, MULTI_SUBOPT, prefix="subopt")
 
     X = dfm.drop(columns=[TARGET_COL])
     y = dfm[TARGET_COL].astype(str)
 
-    # 仅用 train 子集来决定列类型
     X_tr  = X.iloc[train_idx]; y_tr  = y.iloc[train_idx]
     X_val = X.iloc[val_idx];   y_val = y.iloc[val_idx]
     X_te  = X.iloc[test_idx];  y_te  = y.iloc[test_idx]
@@ -350,7 +311,7 @@ def _compute_shared_features(df, train_idx, val_idx, test_idx, seed):
         "pre": pre,
         "X_tr_np":  X_tr_np,
         "X_val_np": X_val_np,
-        "X_te_np":  X_te_np,
+        "X_te_np":  X_te_np,   
         "y_tr":  y_tr.values,
         "y_val": y_val.values,
         "y_te":  y_te.values,
@@ -358,49 +319,33 @@ def _compute_shared_features(df, train_idx, val_idx, test_idx, seed):
     return meta
 
 def softmax_from_shared_features(meta, classes, seed):
-    """
-    在共享特征上训练 Softmax（LR）：
-    - 仅用 train 特征 + y_tr；
-    - 用 val 特征 + y_val 选 C；
-    - 返回对 train/test 的预测概率和 acc。
-    """
     X_tr_np  = meta["X_tr_np"]
     X_val_np = meta["X_val_np"]
-    X_te_np  = meta["X_te_np"]
     y_tr     = meta["y_tr"]
     y_val    = meta["y_val"]
-    y_te     = meta["y_te"]
 
     clf, best_c, _ = _train_lr_with_val(X_tr_np, y_tr, X_val_np, y_val, seed, SOFTMAX_C_GRID)
 
-    P_tr = _align_proba(clf.predict_proba(X_tr_np), clf.classes_, classes)
-    P_te = _align_proba(clf.predict_proba(X_te_np), clf.classes_, classes)
+    P_tr  = _align_proba(clf.predict_proba(X_tr_np),  clf.classes_, classes)
+    P_val = _align_proba(clf.predict_proba(X_val_np), clf.classes_, classes)
 
-    pred_tr = np.array([classes[i] for i in np.argmax(P_tr, axis=1)])
-    pred_te = np.array([classes[i] for i in np.argmax(P_te, axis=1)])
-    acc_tr  = accuracy_score(y_tr, pred_tr)
-    acc_te  = accuracy_score(y_te, pred_te)
-    return P_tr, P_te, acc_tr, acc_te
+    pred_tr  = np.array([classes[i] for i in np.argmax(P_tr, axis=1)])
+    pred_val = np.array([classes[i] for i in np.argmax(P_val, axis=1)])
+    acc_tr   = accuracy_score(y_tr,  pred_tr)
+    acc_val  = accuracy_score(y_val, pred_val)
+    return P_tr, P_val, acc_tr, acc_val
 
 def mlp_from_shared_features(meta, classes, seed):
-    """
-    在共享特征上训练 MLP：
-    - train 上训练，val 上 early stopping；
-    - 最后在 train/test 上评估。
-    """
     seed_all(seed)
 
     X_tr_np  = meta["X_tr_np"]
     X_val_np = meta["X_val_np"]
-    X_te_np  = meta["X_te_np"]
     y_tr     = meta["y_tr"]
     y_val    = meta["y_val"]
-    y_te     = meta["y_te"]
 
     cls2idx = {c: i for i, c in enumerate(classes)}
     y_tr_np  = np.array([cls2idx[s] for s in y_tr],  np.int64)
     y_val_np = np.array([cls2idx[s] for s in y_val], np.int64)
-    y_te_np  = np.array([cls2idx[s] for s in y_te],  np.int64)
 
     model = MLP(in_dim=X_tr_np.shape[1], n_classes=len(classes), p=DROPOUT_P).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -427,7 +372,6 @@ def mlp_from_shared_features(meta, classes, seed):
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             opt.step()
 
-        # 验证集 early stopping
         with torch.no_grad():
             model.eval()
             val_losses = []
@@ -436,7 +380,7 @@ def mlp_from_shared_features(meta, classes, seed):
                 yb = torch.tensor(yb, dtype=torch.long, device=DEVICE)
                 val_losses.append(criterion(model(xb), yb).item() * len(yb))
             val_loss = float(np.sum(val_losses)) / max(1, len(y_val_np))
-            scheduler.step(val_loss) #新增此行以及更换Adam为AdamW
+            scheduler.step(val_loss)
 
         if val_loss < best_val - 1e-4:
             best_val = val_loss
@@ -450,81 +394,127 @@ def mlp_from_shared_features(meta, classes, seed):
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # 在 train + test 上评估（仍然只用 train 训练）
     train_full = DataLoader(NPDataset(X_tr_np, y_tr_np), batch_size=BATCH_SIZE, shuffle=False)
     y_tr_true, y_tr_pred, P_tr = eval_model_with_probs(model, train_full)
 
-    test_loader = DataLoader(NPDataset(X_te_np, y_te_np), batch_size=BATCH_SIZE, shuffle=False)
-    y_te_true, y_te_pred, P_te = eval_model_with_probs(model, test_loader)
+    val_full   = DataLoader(NPDataset(X_val_np, y_val_np), batch_size=BATCH_SIZE, shuffle=False)
+    y_val_true, y_val_pred, P_val = eval_model_with_probs(model, val_full)
 
-    acc_tr = accuracy_score(y_tr_true, y_tr_pred)
-    acc_te = accuracy_score(y_te_true, y_te_pred)
-    return P_tr, P_te, acc_tr, acc_te
+    acc_tr  = accuracy_score(y_tr_true,  y_tr_pred)
+    acc_val = accuracy_score(y_val_true, y_val_pred)
+    return P_tr, P_val, acc_tr, acc_val
 
-# ---------------- 主循环 ----------------
 def run_once(seed):
     df = load_df(CSV_PATH)
     y_all = df[TARGET_COL].astype(str)
     groups = df["student_id"].astype(str)
 
-    # 先切 train/test
     tr_idx, te_idx = grouped_split_with_all_classes(y_all, groups, TEST_SIZE, seed)
 
-    # 再在 train 部分切出 val
     y_tr_all = y_all.iloc[tr_idx]
     groups_tr = groups.iloc[tr_idx]
     idx_tr_in, idx_val_in = grouped_split_with_all_classes(y_tr_all, groups_tr, VAL_SIZE, seed + 1)
     tr_idx_final = np.array(tr_idx)[idx_tr_in]
     val_idx_final = np.array(tr_idx)[idx_val_in]
 
-    # 仅用训练集确定类别集合
     classes = sorted(y_all.iloc[tr_idx_final].unique())
 
-    # 构建并拟合共享预处理器，生成 train/val/test 的统一特征
     meta = _compute_shared_features(df, tr_idx_final, val_idx_final, te_idx, seed)
 
-    # Softmax（在共享特征上的 LR）
-    P_lr_tr, P_lr_te, acc_lr_tr, acc_lr_te = softmax_from_shared_features(
+    P_lr_tr, P_lr_val, acc_lr_tr, acc_lr_val = softmax_from_shared_features(
         meta, classes, seed
     )
 
-    # MLP（在共享特征上的 MLP）
-    P_mlp_tr, P_mlp_te, acc_mlp_tr, acc_mlp_te = mlp_from_shared_features(
+    P_mlp_tr, P_mlp_val, acc_mlp_tr, acc_mlp_val = mlp_from_shared_features(
         meta, classes, seed
     )
 
-    # 简单 0.5 / 0.5 集成
-    P_tr = w_lr * P_lr_tr + w_mlp * P_mlp_tr
-    P_te = w_lr * P_lr_te + w_mlp * P_mlp_te
+    P_tr  = w_lr * P_lr_tr  + w_mlp * P_mlp_tr
+    P_val = w_lr * P_lr_val + w_mlp * P_mlp_val
 
-    pred_tr = np.array([classes[i] for i in np.argmax(P_tr, axis=1)])
-    pred_te = np.array([classes[i] for i in np.argmax(P_te, axis=1)])
-    y_tr = df.loc[tr_idx_final, TARGET_COL].astype(str).values
-    y_te = df.loc[te_idx, TARGET_COL].astype(str).values
+    pred_tr  = np.array([classes[i] for i in np.argmax(P_tr,  axis=1)])
+    pred_val = np.array([classes[i] for i in np.argmax(P_val, axis=1)])
+    y_tr  = df.loc[tr_idx_final,  TARGET_COL].astype(str).values
+    y_val = df.loc[val_idx_final, TARGET_COL].astype(str).values
 
-    acc_tr = accuracy_score(y_tr, pred_tr)
-    acc_te = accuracy_score(y_te, pred_te)
-    return acc_tr, acc_te, (acc_lr_tr, acc_lr_te), (acc_mlp_tr, acc_mlp_te)
+    # Ensemble：acc & macro-F1（train / val）
+    acc_tr  = accuracy_score(y_tr,  pred_tr)
+    acc_val = accuracy_score(y_val, pred_val)
+
+    f1_ens_tr  = f1_score(y_tr,  pred_tr,  average="macro")
+    f1_ens_val = f1_score(y_val, pred_val, average="macro")
+
+    # Ensemble：validation per-class precision & recall
+    prec_val, rec_val, _, _ = precision_recall_fscore_support(
+        y_val, pred_val, labels=classes, average=None, zero_division=0
+    )
+
+    # Softmax & MLP macro-F1（validation）
+    pred_lr_val = np.array([classes[i] for i in np.argmax(P_lr_val, axis=1)])
+    pred_mlp_val = np.array([classes[i] for i in np.argmax(P_mlp_val, axis=1)])
+
+    f1_lr_val  = f1_score(y_val, pred_lr_val,  average="macro")
+    f1_mlp_val = f1_score(y_val, pred_mlp_val, average="macro")
+
+    return (acc_tr, acc_val, f1_ens_tr, f1_ens_val,
+            prec_val, rec_val,
+            (acc_lr_tr,  acc_lr_val,  f1_lr_val),
+            (acc_mlp_tr, acc_mlp_val, f1_mlp_val),
+            classes)
 
 def main():
-    ens_tr, ens_te = [], []
-    lr_tr, lr_te = [], []
-    mlp_tr, mlp_te = [], []
+    ens_tr_acc, ens_val_acc = [], []
+    ens_tr_f1,  ens_val_f1  = [], []
+    lr_tr_acc,  lr_val_acc  = [], []
+    mlp_tr_acc, mlp_val_acc = [], []
+
+    # per-class precision/recall (validation, ensemble)
+    prec_runs = []
+    rec_runs  = []
+    class_names = None
 
     for i in range(N_RUNS):
         seed = SEED_BASE + i
         seed_all(seed)
-        a_tr, a_te, (l_tr, l_te), (m_tr, m_te) = run_once(seed)
-        ens_tr.append(a_tr); ens_te.append(a_te)
-        lr_tr.append(l_tr);  lr_te.append(l_te)
-        mlp_tr.append(m_tr); mlp_te.append(m_te)
+        (a_tr, a_val, f_tr, f_val,
+         prec_val, rec_val,
+         (l_tr, l_val, l_f1),
+         (m_tr, m_val, m_f1),
+         classes) = run_once(seed)
 
-    print("\n=== Variant 3: Softmax & MLP 共享结构化特征工程 ===")
+        ens_tr_acc.append(a_tr);   ens_val_acc.append(a_val)
+        ens_tr_f1.append(f_tr);    ens_val_f1.append(f_val)
+        lr_tr_acc.append(l_tr);    lr_val_acc.append(l_val)
+        mlp_tr_acc.append(m_tr);   mlp_val_acc.append(m_val)
+
+        prec_runs.append(prec_val)
+        rec_runs.append(rec_val)
+        if class_names is None:
+            class_names = classes
+
+    prec_runs = np.stack(prec_runs)  # (N_RUNS, n_classes)
+    rec_runs  = np.stack(rec_runs)
+
+    mean_prec = prec_runs.mean(axis=0)
+    std_prec  = prec_runs.std(axis=0)
+    mean_rec  = rec_runs.mean(axis=0)
+    std_rec   = rec_runs.std(axis=0)
+
     print(f"Runs = {N_RUNS}")
-    print(f"[Ensemble] Train acc mean = {np.mean(ens_tr):.4f} | std = {np.std(ens_tr):.4f}")
-    print(f"[Ensemble] Test  acc mean = {np.mean(ens_te):.4f} | std = {np.std(ens_te):.4f}")
-    print(f"[Softmax ] Train acc mean = {np.mean(lr_tr):.4f} | Test acc mean = {np.mean(lr_te):.4f}")
-    print(f"[MLP     ] Train acc mean = {np.mean(mlp_tr):.4f} | Test acc mean = {np.mean(mlp_te):.4f}")
+    print(f"[Ensemble] Train acc mean = {np.mean(ens_tr_acc):.4f} | std = {np.std(ens_tr_acc):.4f}")
+    print(f"[Ensemble] Val   acc mean = {np.mean(ens_val_acc):.4f} | std = {np.std(ens_val_acc):.4f}")
+    print(f"[Ensemble] Val   F1  mean = {np.mean(ens_val_f1):.4f} | std = {np.std(ens_val_f1):.4f}")
+
+    print(f"[Softmax ] Train acc mean = {np.mean(lr_tr_acc):.4f} | Val acc mean = {np.mean(lr_val_acc):.4f}")
+    print(f"[MLP     ] Train acc mean = {np.mean(mlp_tr_acc):.4f} | Val acc mean = {np.mean(mlp_val_acc):.4f}")
+
+    print("\n[Ensemble] Validation per-class Precision (mean ± std):")
+    for c, m, s in zip(class_names, mean_prec, std_prec):
+        print(f"  {c:>10}: {m:.4f} ± {s:.4f}")
+
+    print("\n[Ensemble] Validation per-class Recall (mean ± std):")
+    for c, m, s in zip(class_names, mean_rec, std_rec):
+        print(f"  {c:>10}: {m:.4f} ± {s:.4f}")
 
 if __name__ == "__main__":
     main()
